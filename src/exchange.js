@@ -1,12 +1,14 @@
 const EventEmitter = require('events')
 const WebSocket = require('websocket').w3cwebsocket
+const axios = require('axios')
 const config = require('./config')
 
 const { ID, getHms, sleep, humanReadyState } = require('./helper')
 const {
   readProducts,
   fetchProducts,
-  saveProducts
+  saveProducts,
+  parseMarket
 } = require('./services/catalog')
 const {
   connections,
@@ -78,6 +80,12 @@ class Exchange extends EventEmitter {
      * @type {{pair: string, from: number, to: number}[]}
      */
     this.recoveryRanges = []
+
+    /**
+     * Local order books keyed by pair.
+     * @type {{[pair: string]: {bids: {[price: string]: number}, asks: {[price: string]: number}, timestamp: number, mid: number, ready: boolean}}}
+     */
+    this.orderBooks = {}
   }
 
   /**
@@ -124,6 +132,15 @@ class Exchange extends EventEmitter {
     }
 
     return Promise.resolve(this.url)
+  }
+
+  /**
+   * Get exchange-specific websocket client config overrides.
+   * @param {string} _url
+   * @param {string} _pair
+   */
+  getWsClientConfig(_url, _pair) {
+    return null
   }
 
   /**
@@ -229,7 +246,15 @@ class Exchange extends EventEmitter {
   }
 
   createWs(url, _pair) {
-    const api = new WebSocket(url)
+    const clientConfig = this.getWsClientConfig(url, _pair)
+    const api = new WebSocket(
+      url,
+      null,
+      null,
+      null,
+      null,
+      clientConfig || undefined
+    )
     api.id = ID()
 
     console.log(
@@ -892,6 +917,385 @@ class Exchange extends EventEmitter {
     return data
   }
 
+  async fetchJson(endpoint) {
+    const request =
+      typeof endpoint === 'string'
+        ? {
+          url: endpoint,
+          method: 'GET'
+        }
+        : endpoint
+
+    const response = await axios({
+      url: request.url,
+      method: request.method || 'GET',
+      data: request.data,
+      headers: request.headers
+    })
+
+    return response.data
+  }
+
+  supportsOpenInterest(_pair) {
+    return false
+  }
+
+  supportsOrderBook(_pair) {
+    return false
+  }
+
+  async fetchOpenInterest(_pair) {
+    return null
+  }
+
+  async fetchOpenInterests(pairs) {
+    const openInterests = {}
+    const supportedPairs = (pairs || []).filter(pair =>
+      this.supportsOpenInterest(pair)
+    )
+
+    await Promise.all(
+      supportedPairs.map(async pair => {
+        try {
+          const openInterest = await this.fetchOpenInterest(pair)
+
+          if (typeof openInterest === 'number' && isFinite(openInterest)) {
+            openInterests[pair] = openInterest
+          }
+        } catch (error) {
+          console.error(
+            `[${this.id}] failed to fetch open interest on ${pair}`,
+            error.message
+          )
+        }
+      })
+    )
+
+    return openInterests
+  }
+
+  getOrderBook(pair) {
+    if (!this.orderBooks[pair]) {
+      this.orderBooks[pair] = {
+        bids: {},
+        asks: {},
+        timestamp: 0,
+        mid: null,
+        ready: false
+      }
+    }
+
+    return this.orderBooks[pair]
+  }
+
+  clearOrderBook(pair) {
+    delete this.orderBooks[pair]
+  }
+
+  normalizeOrderBookLevel(level) {
+    if (!Array.isArray(level) || level.length < 2) {
+      return null
+    }
+
+    const price = +level[0]
+    const size = +level[1]
+
+    if (!isFinite(price) || !isFinite(size) || price <= 0) {
+      return null
+    }
+
+    return [price, size]
+  }
+
+  replaceOrderBookSide(target, levels) {
+    for (const price in target) {
+      delete target[price]
+    }
+
+    this.updateOrderBookSide(target, levels)
+  }
+
+  updateOrderBookSide(target, levels) {
+    if (!Array.isArray(levels)) {
+      return
+    }
+
+    for (const level of levels) {
+      const normalizedLevel = this.normalizeOrderBookLevel(level)
+
+      if (!normalizedLevel) {
+        continue
+      }
+
+      const [price, size] = normalizedLevel
+      const key = price.toString()
+
+      if (!size) {
+        delete target[key]
+      } else {
+        target[key] = size
+      }
+    }
+  }
+
+  updateOrderBookMid(orderBook, explicitMid) {
+    if (typeof explicitMid === 'number' && isFinite(explicitMid) && explicitMid > 0) {
+      orderBook.mid = explicitMid
+      return
+    }
+
+    const bestBid = Math.max(
+      ...Object.keys(orderBook.bids).map(price => +price),
+      0
+    )
+    const askPrices = Object.keys(orderBook.asks).map(price => +price)
+    const bestAsk = askPrices.length ? Math.min(...askPrices) : 0
+
+    if (bestBid > 0 && bestAsk > 0) {
+      orderBook.mid = (bestBid + bestAsk) / 2
+    } else if (bestBid > 0) {
+      orderBook.mid = bestBid
+    } else if (bestAsk > 0) {
+      orderBook.mid = bestAsk
+    }
+  }
+
+  resetOrderBook(pair, bids, asks, timestamp = Date.now(), metadata = {}) {
+    const orderBook = this.getOrderBook(pair)
+
+    this.replaceOrderBookSide(orderBook.bids, bids)
+    this.replaceOrderBookSide(orderBook.asks, asks)
+
+    orderBook.timestamp = timestamp
+    orderBook.ready = true
+
+    Object.assign(orderBook, metadata)
+    this.updateOrderBookMid(orderBook, metadata.mid)
+
+    return orderBook
+  }
+
+  applyOrderBookDelta(pair, bids, asks, timestamp = Date.now(), metadata = {}) {
+    const orderBook = this.getOrderBook(pair)
+
+    this.updateOrderBookSide(orderBook.bids, bids)
+    this.updateOrderBookSide(orderBook.asks, asks)
+
+    orderBook.timestamp = timestamp
+    orderBook.ready = true
+
+    Object.assign(orderBook, metadata)
+    this.updateOrderBookMid(orderBook, metadata.mid)
+
+    return orderBook
+  }
+
+  getOrderBookLevelNotional(_pair, price, size) {
+    return price * size
+  }
+
+  normalizeDepthPriceStep(value) {
+    const step = +value
+
+    if (!isFinite(step) || step <= 0) {
+      return null
+    }
+
+    return step
+  }
+
+  getDepthPriceStepPrecision(step) {
+    const normalizedStep = this.normalizeDepthPriceStep(step)
+
+    if (!normalizedStep) {
+      return 0
+    }
+
+    let precision = 0
+
+    while (
+      precision < 8 &&
+      Math.abs(
+        Math.round(normalizedStep * Math.pow(10, precision)) -
+          normalizedStep * Math.pow(10, precision)
+      ) > 1e-8
+    ) {
+      precision++
+    }
+
+    return precision
+  }
+
+  formatDepthPrice(price, step) {
+    const precision = this.getDepthPriceStepPrecision(step)
+    const factor = Math.pow(10, precision)
+    const normalizedPrice = Math.round(price * factor) / factor
+
+    return precision
+      ? normalizedPrice.toFixed(precision).replace(/\.?0+$/, '')
+      : Math.round(normalizedPrice).toString()
+  }
+
+  getConfiguredDepthPriceStep(pair) {
+    const configuredSteps = config.depthPriceSteps || {}
+    const parsedMarket = parseMarket(this.id, pair, false)
+    const candidates = [
+      `${this.id}:${pair}`,
+      pair,
+      parsedMarket && parsedMarket.base,
+      parsedMarket && parsedMarket.local
+    ].filter(Boolean)
+
+    for (const candidate of candidates) {
+      const step = this.normalizeDepthPriceStep(configuredSteps[candidate])
+
+      if (step) {
+        return step
+      }
+    }
+
+    return null
+  }
+
+  getAutomaticDepthPriceStep(mid) {
+    const price = +mid
+    const targetStep = (price * +config.depthBucketPercent) / 100
+
+    if (!isFinite(targetStep) || targetStep <= 0) {
+      return null
+    }
+
+    const exponent = Math.floor(Math.log10(targetStep))
+    const magnitude = Math.pow(10, exponent)
+    const normalizedTarget = targetStep / magnitude
+    let normalizedStep
+
+    if (normalizedTarget <= 1) {
+      normalizedStep = 1
+    } else if (normalizedTarget <= 2) {
+      normalizedStep = 2
+    } else if (normalizedTarget <= 5) {
+      normalizedStep = 5
+    } else {
+      normalizedStep = 10
+    }
+
+    return normalizedStep * magnitude
+  }
+
+  getDepthPriceStep(pair, orderBook) {
+    const existingStep = this.normalizeDepthPriceStep(orderBook.priceStep)
+
+    if (existingStep) {
+      return existingStep
+    }
+
+    const configuredStep = this.getConfiguredDepthPriceStep(pair)
+    const automaticStep = this.getAutomaticDepthPriceStep(orderBook.mid)
+    const resolvedStep = configuredStep || automaticStep
+
+    if (resolvedStep) {
+      orderBook.priceStep = resolvedStep
+    }
+
+    return resolvedStep
+  }
+
+  roundDepthPriceToStep(price, step, side) {
+    const precision = this.getDepthPriceStepPrecision(step)
+    const factor = Math.pow(10, precision)
+    const scaledStep = Math.round(step * factor)
+    const scaledPrice = Math.round(price * factor)
+
+    if (!scaledStep) {
+      return null
+    }
+
+    const roundedPrice =
+      side === 'bid'
+        ? Math.floor((scaledPrice + 1e-6) / scaledStep) * scaledStep
+        : Math.ceil((scaledPrice - 1e-6) / scaledStep) * scaledStep
+
+    return roundedPrice / factor
+  }
+
+  getOrderBookSnapshot(
+    pair,
+    {
+      rangePercent = config.depthRangePercent
+    } = {}
+  ) {
+    const orderBook = this.orderBooks[pair]
+
+    if (!orderBook || !orderBook.ready || !orderBook.mid) {
+      return null
+    }
+
+    const normalizedRangePercent = +rangePercent / 100
+    const priceStep = this.getDepthPriceStep(pair, orderBook)
+
+    if (
+      !normalizedRangePercent ||
+      !priceStep ||
+      normalizedRangePercent <= 0
+    ) {
+      return null
+    }
+
+    const bids = {}
+    const asks = {}
+
+    for (const [priceText, size] of Object.entries(orderBook.bids)) {
+      const price = +priceText
+      const distance = (orderBook.mid - price) / orderBook.mid
+
+      if (!isFinite(distance) || distance <= 0 || distance > normalizedRangePercent) {
+        continue
+      }
+
+      const bucketPrice = this.roundDepthPriceToStep(price, priceStep, 'bid')
+
+      if (!bucketPrice || bucketPrice <= 0) {
+        continue
+      }
+
+      const bucketKey = this.formatDepthPrice(bucketPrice, priceStep)
+
+      bids[bucketKey] =
+        (bids[bucketKey] || 0) +
+        this.getOrderBookLevelNotional(pair, price, +size)
+    }
+
+    for (const [priceText, size] of Object.entries(orderBook.asks)) {
+      const price = +priceText
+      const distance = (price - orderBook.mid) / orderBook.mid
+
+      if (!isFinite(distance) || distance <= 0 || distance > normalizedRangePercent) {
+        continue
+      }
+
+      const bucketPrice = this.roundDepthPriceToStep(price, priceStep, 'ask')
+
+      if (!bucketPrice || bucketPrice <= 0) {
+        continue
+      }
+
+      const bucketKey = this.formatDepthPrice(bucketPrice, priceStep)
+
+      asks[bucketKey] =
+        (asks[bucketKey] || 0) +
+        this.getOrderBookLevelNotional(pair, price, +size)
+    }
+
+    return {
+      mid: orderBook.mid,
+      priceStep,
+      bids,
+      asks,
+      rangePercent
+    }
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -920,6 +1324,8 @@ class Exchange extends EventEmitter {
       // pair is already detached
       return false
     }
+
+    this.clearOrderBook(pair)
 
     this.emit('disconnected', pair, api.id, api._connected.length)
 

@@ -39,6 +39,11 @@ class InfluxStorage {
      * @type {number}
      */
     this.influxTimeframeRetentionDuration = null
+
+    /**
+     * @type {{[identifier: string]: number}}
+     */
+    this.latestOpenInterests = {}
   }
 
   async connect() {
@@ -50,7 +55,9 @@ class InfluxStorage {
     let port = config.influxPort
 
     if (typeof config.influxUrl === 'string' && config.influxUrl.length) {
-      ;[host, port] = config.influxUrl.split(':')
+      const urlParts = config.influxUrl.split(':')
+      host = urlParts[0]
+      port = urlParts[1]
     }
 
     console.log(
@@ -261,7 +268,7 @@ class InfluxStorage {
       .map(market => `market = '${market}'`)
       .join(' OR ')})`
 
-    query += 'GROUP BY "market" ORDER BY time DESC LIMIT 1'
+    query += ' GROUP BY "market" ORDER BY time DESC LIMIT 1'
 
     this.influx.query(query).then(data => {
       for (let bar of data) {
@@ -284,28 +291,59 @@ class InfluxStorage {
         } else {
           this.pendingBars[bar.market][+bar.time] = this.sumBar({}, bar)
         }
+
+        if (typeof bar.oi === 'number' && isFinite(+bar.oi)) {
+          this.latestOpenInterests[bar.market] = +bar.oi
+        }
       }
     })
   }
 
   sumBar(barToMutate, barToAdd) {
-    const props = Object.keys(barToMutate)
-      .concat(Object.keys(barToAdd))
-      .filter((x, i, a) => a.indexOf(x) == i)
+    const summedProps = ['cbuy', 'csell', 'vbuy', 'vsell', 'lbuy', 'lsell']
 
-    for (let i = 0; i < props.length; i++) {
-      const prop = props[i]
+    if (typeof barToMutate.time === 'undefined') {
+      barToMutate.time = +barToAdd.time
+    }
 
-      const value = isNaN(barToAdd[prop]) ? barToAdd[prop] : +barToAdd[prop]
+    if (typeof barToMutate.market === 'undefined') {
+      barToMutate.market = barToAdd.market
+    }
 
-      if (typeof barToMutate[prop] === 'undefined') {
-        barToMutate[prop] = value
-        continue
-      }
+    for (let i = 0; i < summedProps.length; i++) {
+      const prop = summedProps[i]
+      const value = +barToAdd[prop] || 0
 
-      if (typeof barToMutate[prop] === 'number') {
-        barToMutate[props] += value
-      }
+      barToMutate[prop] = (barToMutate[prop] || 0) + value
+    }
+
+    if (barToAdd.open !== null && typeof barToAdd.open !== 'undefined') {
+      barToMutate.open =
+        barToMutate.open === null || typeof barToMutate.open === 'undefined'
+          ? +barToAdd.open
+          : barToMutate.open
+    }
+
+    if (barToAdd.high !== null && typeof barToAdd.high !== 'undefined') {
+      barToMutate.high =
+        barToMutate.high === null || typeof barToMutate.high === 'undefined'
+          ? +barToAdd.high
+          : Math.max(barToMutate.high, +barToAdd.high)
+    }
+
+    if (barToAdd.low !== null && typeof barToAdd.low !== 'undefined') {
+      barToMutate.low =
+        barToMutate.low === null || typeof barToMutate.low === 'undefined'
+          ? +barToAdd.low
+          : Math.min(barToMutate.low, +barToAdd.low)
+    }
+
+    if (barToAdd.close !== null && typeof barToAdd.close !== 'undefined') {
+      barToMutate.close = +barToAdd.close
+    }
+
+    if (typeof barToAdd.oi === 'number' && isFinite(+barToAdd.oi)) {
+      barToMutate.oi = +barToAdd.oi
     }
 
     if (
@@ -397,7 +435,7 @@ class InfluxStorage {
         Math.floor(trade.timestamp / config.influxTimeframe) *
         config.influxTimeframe
 
-      if (!trade.liquidation) {
+      if (!trade.liquidation && typeof trade.price === 'number') {
         if (!ranges[market]) {
           ranges[market] = {
             low: trade.price,
@@ -441,6 +479,10 @@ class InfluxStorage {
             vsell: 0,
             lbuy: 0,
             lsell: 0,
+            oi:
+              typeof this.latestOpenInterests[market] === 'number'
+                ? this.latestOpenInterests[market]
+                : null,
             open: null,
             high: null,
             low: null,
@@ -448,6 +490,19 @@ class InfluxStorage {
           }
           //console.log(`\tcreate new bar (time ${new Date(bars[market].time).toISOString().split('T').pop().replace(/\..*/, '')})`)
         }
+      }
+
+      if (typeof trade.openInterest === 'number' && isFinite(trade.openInterest)) {
+        bars[market].oi = trade.openInterest
+        this.latestOpenInterests[market] = trade.openInterest
+        continue
+      }
+
+      if (
+        typeof bars[market].oi !== 'number' &&
+        typeof this.latestOpenInterests[market] === 'number'
+      ) {
+        bars[market].oi = this.latestOpenInterests[market]
       }
 
       if (trade.liquidation) {
@@ -578,11 +633,15 @@ class InfluxStorage {
             fields.lsell = bar.lsell
           }
 
+          if (typeof bar.oi === 'number' && isFinite(bar.oi)) {
+            fields.oi = bar.oi
+          }
+
           if (bar.close !== null) {
-            ;(fields.open = bar.open),
-            (fields.high = bar.high),
-            (fields.low = bar.low),
-            (fields.close = bar.close)
+            fields.open = bar.open
+            fields.high = bar.high
+            fields.low = bar.low
+            fields.close = bar.close
           }
 
           return {
@@ -736,6 +795,7 @@ class InfluxStorage {
       max(high) AS high, 
       first(open) AS open, 
       last(close) AS close, 
+      last(oi) AS oi, 
       sum(count) AS count, 
       sum(cbuy) AS cbuy, 
       sum(csell) AS csell, 
@@ -1073,7 +1133,10 @@ class InfluxStorage {
     for (const market of markets) {
       if (this.pendingBars[market]) {
         for (const timestamp in this.pendingBars[market]) {
-          if (this.pendingBars[market][timestamp].close === null) {
+          if (
+            this.pendingBars[market][timestamp].close === null &&
+            typeof this.pendingBars[market][timestamp].oi !== 'number'
+          ) {
             continue
           }
 

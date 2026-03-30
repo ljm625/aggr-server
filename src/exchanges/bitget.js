@@ -47,6 +47,65 @@ class Bitget extends Exchange {
     }
   }
 
+  supportsOpenInterest(pair) {
+    return !!this.types[pair] && this.types[pair] !== 'spot'
+  }
+
+  supportsOrderBook(pair) {
+    return !!this.types[pair]
+  }
+
+  async fetchOpenInterests(pairs) {
+    const openInterests = {}
+    const pairsByType = pairs.reduce((output, pair) => {
+      const type = this.types[pair]
+
+      if (!type || type === 'spot') {
+        return output
+      }
+
+      if (!output[type]) {
+        output[type] = []
+      }
+
+      output[type].push(pair)
+
+      return output
+    }, {})
+
+    await Promise.all(
+      Object.keys(pairsByType).map(async type => {
+        const response = await this.fetchJson(
+          `https://api.bitget.com/api/v3/market/tickers?category=${type.toUpperCase()}`
+        )
+        const tickers = response.data || []
+        const byPair = tickers.reduce((output, ticker) => {
+          output[this.formatRemoteToLocalPair(ticker.symbol, type)] = ticker
+          return output
+        }, {})
+
+        for (const pair of pairsByType[type]) {
+          const ticker = byPair[pair]
+
+          if (!ticker) {
+            continue
+          }
+
+          const value = +ticker.openInterest
+          const price = +ticker.markPrice || +ticker.lastPrice
+
+          if (!isFinite(value) || !price) {
+            continue
+          }
+
+          openInterests[pair] = value * price
+        }
+      })
+    )
+
+    return openInterests
+  }
+
   getLiquidationArgs() {
     return ['usdt-futures', 'coin-futures', 'usdc-futures'].map(instType => ({
       instType,
@@ -74,6 +133,86 @@ class Bitget extends Exchange {
     return api._connected.some(pair => this.types[pair] && this.types[pair] !== 'spot')
   }
 
+  getOrderBookArgs(pair) {
+    const type = this.types[pair].toLowerCase()
+
+    return {
+      instType: type,
+      topic: 'books',
+      symbol: this.formatLocalToRemotePair(pair, type)
+    }
+  }
+
+  isPairTrackedByApi(api, pair) {
+    return api._connected.indexOf(pair) !== -1 || api._pending.indexOf(pair) !== -1
+  }
+
+  invalidateOrderBookState(api, pair) {
+    this.clearOrderBook(pair)
+
+    if (api._orderBookRebuilds) {
+      delete api._orderBookRebuilds[pair]
+    }
+  }
+
+  scheduleOrderBookRebuild(api, pair, reason) {
+    if (
+      !api ||
+      !this.supportsOrderBook(pair) ||
+      !this.isPairTrackedByApi(api, pair)
+    ) {
+      return false
+    }
+
+    if (api._orderBookRebuilds[pair]) {
+      return false
+    }
+
+    api._orderBookRebuilds[pair] = true
+    this.clearOrderBook(pair)
+
+    console.warn(
+      `[${this.id}] depth sequence broke on ${pair} (${reason}), rebuilding local book`
+    )
+
+    const args = [this.getOrderBookArgs(pair)]
+
+    ;(async () => {
+      try {
+        if (api.readyState === 1) {
+          api.send(
+            JSON.stringify({
+              op: 'unsubscribe',
+              args
+            })
+          )
+        }
+
+        await sleep(150)
+
+        if (api.readyState === 1 && this.isPairTrackedByApi(api, pair)) {
+          api.send(
+            JSON.stringify({
+              op: 'subscribe',
+              args
+            })
+          )
+        }
+
+        await sleep(300)
+      } catch (error) {
+        console.error(
+          `[${this.id}] failed to rebuild order book on ${pair}`,
+          error.message
+        )
+      } finally {
+        delete api._orderBookRebuilds[pair]
+      }
+    })()
+
+    return true
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -87,6 +226,7 @@ class Bitget extends Exchange {
     const type = this.types[pair].toLowerCase()
     const isSpot = type === 'spot'
     const wsSymbol = this.formatLocalToRemotePair(pair, type)
+    const orderBookArgs = this.getOrderBookArgs(pair)
 
     api.send(
       JSON.stringify({
@@ -96,6 +236,9 @@ class Bitget extends Exchange {
             instType: type,
             topic: 'publicTrade',
             symbol: wsSymbol
+          },
+          {
+            ...orderBookArgs
           }
         ]
       })
@@ -129,6 +272,7 @@ class Bitget extends Exchange {
 
     const type = this.types[pair].toLowerCase()
     const wsSymbol = this.formatLocalToRemotePair(pair, type)
+    const orderBookArgs = this.getOrderBookArgs(pair)
 
     api.send(
       JSON.stringify({
@@ -138,6 +282,9 @@ class Bitget extends Exchange {
             instType: type,
             topic: 'publicTrade',
             symbol: wsSymbol
+          },
+          {
+            ...orderBookArgs
           }
         ]
       })
@@ -156,6 +303,8 @@ class Bitget extends Exchange {
 
     // this websocket api have a limit of about 10 messages per second.
     await sleep(150)
+
+    this.invalidateOrderBookState(api, pair)
   }
 
   formatTrade(trade, pair, instType) {
@@ -204,6 +353,15 @@ class Bitget extends Exchange {
 
     const json = JSON.parse(event.data)
 
+    if (json.event === 'error') {
+      console.error(
+        `[${this.id}] websocket error`,
+        json.code || '',
+        json.msg || ''
+      )
+      return
+    }
+
     if (!json.arg || !json.data || !json.data.length) {
       return
     }
@@ -222,6 +380,10 @@ class Bitget extends Exchange {
         api.id,
         json.data.map(trade => this.formatTrade(trade, pair, wsInstType))
       )
+    }
+
+    if (json.arg.topic === 'books') {
+      return this.handleOrderBookMessage(json, api)
     }
 
     if (json.arg.topic === 'liquidation') {
@@ -244,8 +406,82 @@ class Bitget extends Exchange {
     }
   }
 
+  handleOrderBookMessage(message, api) {
+    const data = message.data && message.data[0]
+
+    if (!data) {
+      return
+    }
+
+    const pair = this.formatRemoteToLocalPair(
+      message.arg.symbol || data.symbol,
+      message.arg.instType
+    )
+    const bids = data.bids || data.b || []
+    const asks = data.asks || data.a || []
+    const timestamp = +(data.ts || Date.now())
+    const sequence = +data.seq
+    const previousSequence = +data.pseq
+    const hasSequence = isFinite(sequence)
+    const hasPreviousSequence = isFinite(previousSequence)
+
+    if (message.action === 'snapshot') {
+      this.resetOrderBook(pair, bids, asks, timestamp, {
+        sequence: hasSequence ? sequence : undefined,
+        sequenceSynced: false
+      })
+
+      return true
+    }
+
+    const orderBook = this.getOrderBook(pair)
+    const lastSequence = +orderBook.sequence
+
+    if (!orderBook.ready || !isFinite(lastSequence)) {
+      return this.scheduleOrderBookRebuild(api, pair, 'missing snapshot')
+    }
+
+    if (!hasSequence || !hasPreviousSequence) {
+      return this.scheduleOrderBookRebuild(api, pair, 'missing sequence')
+    }
+
+    if (sequence <= lastSequence) {
+      return false
+    }
+
+    if (orderBook.sequenceSynced === false) {
+      if (
+        previousSequence === 0 ||
+        previousSequence > lastSequence ||
+        lastSequence > sequence
+      ) {
+        return this.scheduleOrderBookRebuild(api, pair, 'gap detected')
+      }
+    } else {
+      if (previousSequence === 0) {
+        return this.scheduleOrderBookRebuild(api, pair, 'sequence reset')
+      }
+
+      if (previousSequence !== lastSequence) {
+        return this.scheduleOrderBookRebuild(api, pair, 'gap detected')
+      }
+    }
+
+    this.applyOrderBookDelta(pair, bids, asks, timestamp, {
+      sequence,
+      sequenceSynced: true
+    })
+
+    return true
+  }
+
+  getOrderBookLevelNotional(pair, price, size) {
+    return this.types[pair] === 'coin-futures' ? size : price * size
+  }
+
   onApiCreated(api) {
     api._liquidationSubscribed = false
+    api._orderBookRebuilds = {}
     this.startKeepAlive(api, 'ping', 30000)
   }
 

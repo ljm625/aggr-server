@@ -6,8 +6,8 @@ const alertService = require('../services/alert')
 const { updateIndexes } = require('../services/connections')
 
 /**
- * Size in bytes of a single OHLCV record in the binary file.
- * Layout (56 bytes total):
+ * Size in bytes of a single OHLCV+OI record in the binary file.
+ * Layout (64 bytes total):
  *   - open:  Int32LE  (4 bytes, offset 0)
  *   - high:  Int32LE  (4 bytes, offset 4)
  *   - low:   Int32LE  (4 bytes, offset 8)
@@ -18,9 +18,11 @@ const { updateIndexes } = require('../services/connections')
  *   - csell: UInt32LE (4 bytes, offset 36)
  *   - lbuy:  BigInt64LE (8 bytes, offset 40)
  *   - lsell: BigInt64LE (8 bytes, offset 48)
+ *   - oi:    BigInt64LE (8 bytes, offset 56)
  * @constant {number}
  */
-const RECORD_SIZE = 56
+const LEGACY_RECORD_SIZE = 56
+const RECORD_SIZE = 64
 
 /**
  * Scale factor for storing prices as integers.
@@ -81,6 +83,7 @@ const VOLUME_SCALE = 1000000
  * @property {number} csell - Sell trade count
  * @property {number} lbuy - Buy liquidation volume
  * @property {number} lsell - Sell liquidation volume
+ * @property {number|null} oi - Open interest in USD notional
  */
 
 /**
@@ -141,10 +144,75 @@ class BinariesStorage {
      */
     this.timeframes = [config.influxTimeframe].concat(config.influxResampleTo || [])
 
+    /**
+     * Latest open interest known for each market.
+     * @type {Object<string, number>}
+     */
+    this.latestOpenInterests = {}
+
     // Ensure the data directory exists
     if (!fs.existsSync(config.filesLocation)) {
       fs.mkdirSync(config.filesLocation, { recursive: true })
     }
+  }
+
+  getRecordSize(meta) {
+    return (meta && meta.recordSize) || LEGACY_RECORD_SIZE
+  }
+
+  hasBarData(bar) {
+    return !!(
+      (bar &&
+        ((typeof bar.open === 'number' && isFinite(bar.open)) ||
+          (typeof bar.close === 'number' && isFinite(bar.close)))) ||
+      (bar && (bar.vbuy || bar.vsell || bar.cbuy || bar.csell || bar.lbuy || bar.lsell)) ||
+      (bar && typeof bar.oi === 'number' && isFinite(bar.oi))
+    )
+  }
+
+  isNullRecord(record) {
+    return !this.hasBarData(record)
+  }
+
+  ensureCurrentRecordSize(paths, meta) {
+    if (!meta || this.getRecordSize(meta) === RECORD_SIZE) {
+      return meta
+    }
+
+    const nextMeta = {
+      ...meta,
+      recordSize: RECORD_SIZE
+    }
+
+    if (!fs.existsSync(paths.bin)) {
+      this.writeMeta(paths.json, nextMeta)
+      return nextMeta
+    }
+
+    const legacyRecordSize = this.getRecordSize(meta)
+    const source = fs.readFileSync(paths.bin)
+    const recordCount = Math.floor(source.length / legacyRecordSize)
+    const migrated = Buffer.alloc(recordCount * RECORD_SIZE)
+
+    for (let i = 0; i < recordCount; i++) {
+      const record = this.readRecord(source, i * legacyRecordSize, meta)
+      this.writeRecord(
+        migrated,
+        i * RECORD_SIZE,
+        {
+          ...this.createNullBar(meta.startTs + i * meta.timeframeMs),
+          ...record
+        },
+        nextMeta
+      )
+    }
+
+    const tmpPath = paths.bin + '.tmp'
+    fs.writeFileSync(tmpPath, migrated)
+    fs.renameSync(tmpPath, paths.bin)
+    this.writeMeta(paths.json, nextMeta)
+
+    return nextMeta
   }
 
   /**
@@ -187,6 +255,7 @@ class BinariesStorage {
     const meta = this.readMeta(paths.json)
     if (!meta) return null
     if (!fs.existsSync(paths.bin)) return null
+    const recordSize = this.getRecordSize(meta)
 
     // Check if bucketTs is within the file's range
     if (bucketTs < meta.startTs || bucketTs >= meta.endTs) return null
@@ -195,19 +264,19 @@ class BinariesStorage {
     const index = Math.floor((bucketTs - meta.startTs) / meta.timeframeMs)
     if (index < 0 || index >= meta.records) return null
 
-    const byteOffset = index * RECORD_SIZE
-    const buffer = Buffer.alloc(RECORD_SIZE)
+    const byteOffset = index * recordSize
+    const buffer = Buffer.alloc(recordSize)
 
     let fd
     try {
       fd = fs.openSync(paths.bin, 'r')
       const stat = fs.fstatSync(fd)
-      if (byteOffset + RECORD_SIZE > stat.size) {
+      if (byteOffset + recordSize > stat.size) {
         fs.closeSync(fd)
         return null
       }
       // Positioned read - only reads the single record we need
-      fs.readSync(fd, buffer, 0, RECORD_SIZE, byteOffset)
+      fs.readSync(fd, buffer, 0, recordSize, byteOffset)
       fs.closeSync(fd)
     } catch (_e) {
       if (fd !== undefined) {
@@ -218,8 +287,7 @@ class BinariesStorage {
 
     const record = this.readRecord(buffer, 0, meta)
 
-    // Check if this is a null record (all OHLC are zero)
-    if (record.open === 0 && record.high === 0 && record.low === 0 && record.close === 0) {
+    if (this.isNullRecord(record)) {
       return null
     }
 
@@ -234,7 +302,8 @@ class BinariesStorage {
       cbuy: record.cbuy,
       csell: record.csell,
       lbuy: record.lbuy,
-      lsell: record.lsell
+      lsell: record.lsell,
+      oi: record.oi
     }
   }
 
@@ -322,7 +391,7 @@ class BinariesStorage {
       const market = trade.exchange + ':' + trade.pair
 
       // Track price ranges for alert crossover checks (non-liquidation trades only)
-      if (!trade.liquidation) {
+      if (!trade.liquidation && typeof trade.price === 'number') {
         if (!ranges[market]) {
           ranges[market] = { low: trade.price, high: trade.price, close: trade.price }
         } else {
@@ -362,6 +431,10 @@ class BinariesStorage {
         if (parsed) {
           const diskBar = this.readSingleRecordAtTs(parsed.exchange, parsed.symbol, timeframe, tradeFlooredTime)
           if (diskBar) {
+            if (typeof diskBar.oi === 'number') {
+              this.latestOpenInterests[market] = diskBar.oi
+            }
+
             bar = {
               time: tradeFlooredTime,
               market: market,
@@ -371,6 +444,7 @@ class BinariesStorage {
               vsell: diskBar.vsell,
               lbuy: diskBar.lbuy,
               lsell: diskBar.lsell,
+              oi: diskBar.oi,
               open: diskBar.open,
               high: diskBar.high,
               low: diskBar.low,
@@ -392,11 +466,28 @@ class BinariesStorage {
           vsell: 0,
           lbuy: 0,
           lsell: 0,
+          oi:
+            typeof this.latestOpenInterests[market] === 'number'
+              ? this.latestOpenInterests[market]
+              : null,
           open: null,
           high: null,
           low: null,
           close: null
         }
+      }
+
+      if (typeof trade.openInterest === 'number' && isFinite(trade.openInterest)) {
+        bar.oi = trade.openInterest
+        this.latestOpenInterests[market] = trade.openInterest
+        continue
+      }
+
+      if (
+        typeof bar.oi !== 'number' &&
+        typeof this.latestOpenInterests[market] === 'number'
+      ) {
+        bar.oi = this.latestOpenInterests[market]
       }
 
       if (trade.liquidation) {
@@ -457,8 +548,7 @@ class BinariesStorage {
         // Bar is closed if its time is before current bucket (or if exiting)
         if (isExiting || alignedBarTime < closedThreshold) {
           const bar = barsMap[ts]
-          // Only persist bars that have actual data (non-null close)
-          if (bar.close !== null) {
+          if (this.hasBarData(bar)) {
             bar.time = alignedBarTime
             closedBars.push(bar)
           }
@@ -556,6 +646,7 @@ class BinariesStorage {
     await ensureDirectoryExists(paths.bin)
 
     let meta = this.readMeta(paths.json)
+    meta = this.ensureCurrentRecordSize(paths, meta)
 
     // Compute dirty target bucket range (inclusive)
     // A target bucket is dirty if any of its contributing base buckets were modified
@@ -573,6 +664,7 @@ class BinariesStorage {
         endTs: firstTargetBucket,
         priceScale: PRICE_SCALE,
         volumeScale: VOLUME_SCALE,
+        recordSize: RECORD_SIZE,
         records: 0,
         lastInputStartTs: firstTargetBucket
       }
@@ -597,8 +689,9 @@ class BinariesStorage {
 
     if (clampedStartIndex < clampedEndIndex) {
       const count = clampedEndIndex - clampedStartIndex
-      const byteOffset = clampedStartIndex * RECORD_SIZE
-      const byteLength = count * RECORD_SIZE
+      const baseRecordSize = this.getRecordSize(baseMeta)
+      const byteOffset = clampedStartIndex * baseRecordSize
+      const byteLength = count * baseRecordSize
 
       let buffer
       try {
@@ -615,15 +708,14 @@ class BinariesStorage {
       }
 
       if (buffer) {
-        const recordCount = Math.floor(buffer.length / RECORD_SIZE)
+        const recordCount = Math.floor(buffer.length / baseRecordSize)
 
         // Process each base record and aggregate into target buckets
         for (let i = 0; i < recordCount; i++) {
-          const record = this.readRecord(buffer, i * RECORD_SIZE, baseMeta)
+          const record = this.readRecord(buffer, i * baseRecordSize, baseMeta)
           const barTime = baseMeta.startTs + (clampedStartIndex + i) * baseTimeframe
 
-          // Skip null records (gaps in base data)
-          if (record.open === 0 && record.high === 0 && record.low === 0 && record.close === 0) continue
+          if (this.isNullRecord(record)) continue
 
           // Determine which target bucket this base bar contributes to
           const targetBucketTime = Math.floor(barTime / targetTimeframe) * targetTimeframe
@@ -643,22 +735,29 @@ class BinariesStorage {
               csell: record.csell,
               lbuy: record.lbuy,
               lsell: record.lsell,
-              _firstBarTime: barTime // Track earliest base bar for open determination
+              oi: record.oi,
+              _firstBarTime: record.close !== null ? barTime : null
             }
           } else {
             // Merge subsequent base bars into the aggregate
             const agg = aggregated[targetBucketTime]
 
             // Open comes from the earliest base bar (by time, not arrival order)
-            if (barTime < agg._firstBarTime) {
+            if (
+              record.close !== null &&
+              (agg._firstBarTime === null || barTime < agg._firstBarTime)
+            ) {
               agg.open = record.open
               agg._firstBarTime = barTime
             }
 
-            // High/low are extrema, close comes from the last bar processed
-            agg.high = Math.max(agg.high, record.high)
-            agg.low = Math.min(agg.low, record.low)
-            agg.close = record.close
+            if (record.close !== null) {
+              agg.high =
+                agg.high === null ? record.high : Math.max(agg.high, record.high)
+              agg.low =
+                agg.low === null ? record.low : Math.min(agg.low, record.low)
+              agg.close = record.close
+            }
 
             // Volumes and counts are summed
             agg.vbuy += record.vbuy
@@ -667,6 +766,10 @@ class BinariesStorage {
             agg.csell += record.csell
             agg.lbuy += record.lbuy
             agg.lsell += record.lsell
+
+            if (typeof record.oi === 'number') {
+              agg.oi = record.oi
+            }
           }
         }
       }
@@ -818,6 +921,7 @@ class BinariesStorage {
     await ensureDirectoryExists(paths.bin)
 
     let meta = this.readMeta(paths.json)
+    meta = this.ensureCurrentRecordSize(paths, meta)
 
     // Get time bounds of input bars
     const firstBarTime = Math.floor(bars[0].time / timeframe) * timeframe
@@ -834,17 +938,18 @@ class BinariesStorage {
         endTs: firstBarTime,
         priceScale: PRICE_SCALE,
         volumeScale: VOLUME_SCALE,
+        recordSize: RECORD_SIZE,
         records: 0,
         lastInputStartTs: firstBarTime
       }
     }
 
-    // Filter to only bars that can be appended (>= endTs, non-null close)
+    // Filter to only bars that can be appended (>= endTs, non-empty)
     const barsToWriteMap = {}
     for (const bar of bars) {
       const alignedTime = Math.floor(bar.time / timeframe) * timeframe
       if (alignedTime < meta.endTs) continue // Skip existing records
-      if (bar.close === null) continue // Skip empty bars
+      if (!this.hasBarData(bar)) continue
       barsToWriteMap[alignedTime] = bar
     }
 
@@ -923,9 +1028,9 @@ class BinariesStorage {
     await ensureDirectoryExists(paths.bin)
 
     let meta = this.readMeta(paths.json)
+    meta = this.ensureCurrentRecordSize(paths, meta)
 
-    // Filter out bars with null close (empty bars)
-    const validBars = bars.filter(b => b.close !== null)
+    const validBars = bars.filter(bar => this.hasBarData(bar))
     if (validBars.length === 0) return { fromTsWritten: null, toTsWritten: null }
 
     // Build map of aligned timestamps to bars
@@ -952,6 +1057,7 @@ class BinariesStorage {
         endTs: firstBarTime,
         priceScale: PRICE_SCALE,
         volumeScale: VOLUME_SCALE,
+        recordSize: RECORD_SIZE,
         records: 0,
         lastInputStartTs: firstBarTime
       }
@@ -1107,14 +1213,15 @@ class BinariesStorage {
       cbuy: 0,
       csell: 0,
       lbuy: 0,
-      lsell: 0
+      lsell: 0,
+      oi: null
     }
   }
 
   /**
    * Writes a bar record to a buffer at the specified offset.
    * 
-   * Binary layout (56 bytes):
+   * Binary layout (64 bytes):
    * - Bytes 0-3:   open (Int32LE, scaled by priceScale)
    * - Bytes 4-7:   high (Int32LE, scaled)
    * - Bytes 8-11:  low (Int32LE, scaled)
@@ -1125,6 +1232,7 @@ class BinariesStorage {
    * - Bytes 36-39: csell (UInt32LE, trade count)
    * - Bytes 40-47: lbuy (BigInt64LE, liquidation volume, scaled)
    * - Bytes 48-55: lsell (BigInt64LE, liquidation volume, scaled)
+   * - Bytes 56-63: oi (BigInt64LE, open interest, scaled by volumeScale)
    * 
    * @param {Buffer} buffer - Target buffer
    * @param {number} offset - Byte offset in buffer
@@ -1159,6 +1267,14 @@ class BinariesStorage {
     const lsell = BigInt(Math.round((bar.lsell || 0) * meta.volumeScale))
     buffer.writeBigInt64LE(lbuy, offset + 40)
     buffer.writeBigInt64LE(lsell, offset + 48)
+
+    const oi = BigInt(
+      Math.round(
+        (typeof bar.oi === 'number' && isFinite(bar.oi) ? bar.oi : 0) *
+        meta.volumeScale
+      )
+    )
+    buffer.writeBigInt64LE(oi, offset + 56)
   }
 
   /**
@@ -1187,8 +1303,24 @@ class BinariesStorage {
     // Read and descale liquidation volumes
     const lbuy = Number(buffer.readBigInt64LE(offset + 40)) / meta.volumeScale
     const lsell = Number(buffer.readBigInt64LE(offset + 48)) / meta.volumeScale
+    const oi =
+      this.getRecordSize(meta) >= RECORD_SIZE
+        ? Number(buffer.readBigInt64LE(offset + 56)) / meta.volumeScale
+        : 0
 
-    return { open, high, low, close, vbuy, vsell, cbuy, csell, lbuy, lsell }
+    return {
+      open: open || high || low || close ? open : null,
+      high: open || high || low || close ? high : null,
+      low: open || high || low || close ? low : null,
+      close: open || high || low || close ? close : null,
+      vbuy,
+      vsell,
+      cbuy,
+      csell,
+      lbuy,
+      lsell,
+      oi: oi ? oi : null
+    }
   }
 
   /**
@@ -1253,7 +1385,8 @@ class BinariesStorage {
       cbuy: 8,
       csell: 9,
       lbuy: 10,
-      lsell: 11
+      lsell: 11,
+      oi: 12
     }
 
     // Pre-allocate with estimated capacity to reduce array resizing
@@ -1271,6 +1404,7 @@ class BinariesStorage {
       const paths = this.getFilePath(parsed.exchange, parsed.symbol, timeframe)
       const meta = this.readMeta(paths.json)
       if (!meta) continue
+      const recordSize = this.getRecordSize(meta)
 
       if (!fs.existsSync(paths.bin)) continue
 
@@ -1284,8 +1418,8 @@ class BinariesStorage {
       if (startIndex >= endIndex) continue
 
       const count = endIndex - startIndex
-      const byteOffset = startIndex * RECORD_SIZE
-      const byteLength = count * RECORD_SIZE
+      const byteOffset = startIndex * recordSize
+      const byteLength = count * recordSize
 
       // Read the range from disk
       let buffer
@@ -1309,12 +1443,11 @@ class BinariesStorage {
       }
 
       // Decode records and add to results
-      const recordCount = Math.floor(buffer.length / RECORD_SIZE)
+      const recordCount = Math.floor(buffer.length / recordSize)
       for (let i = 0; i < recordCount; i++) {
-        const record = this.readRecord(buffer, i * RECORD_SIZE, meta)
+        const record = this.readRecord(buffer, i * recordSize, meta)
 
-        // Skip null bars (gaps) - check before computing barTime for efficiency
-        if (record.open === 0 && record.high === 0 && record.low === 0 && record.close === 0) continue
+        if (this.isNullRecord(record)) continue
 
         const barTime = meta.startTs + (startIndex + i) * meta.timeframeMs
 
@@ -1335,7 +1468,8 @@ class BinariesStorage {
           record.cbuy,
           record.csell,
           record.lbuy,
-          record.lsell
+          record.lsell,
+          record.oi
         ])
       }
     }
@@ -1358,7 +1492,8 @@ class BinariesStorage {
           bar.cbuy,
           bar.csell,
           bar.lbuy,
-          bar.lsell
+          bar.lsell,
+          bar.oi
         ])
       }
     }
@@ -1397,8 +1532,7 @@ class BinariesStorage {
       for (const ts in barsMap) {
         const bar = barsMap[ts]
 
-        // Skip empty bars
-        if (bar.close === null) continue
+        if (!this.hasBarData(bar)) continue
 
         const barTime = Number(ts)
 

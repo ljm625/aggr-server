@@ -94,6 +94,53 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /depth/{from}/{to}/{markets}:
+    get:
+      summary: Get order book depth snapshots
+      parameters:
+        - in: path
+          name: from
+          schema:
+            type: integer
+          required: true
+          description: Start timestamp of the depth data
+        - in: path
+          name: to
+          schema:
+            type: integer
+          required: true
+          description: End timestamp of the depth data
+        - in: path
+          name: markets
+          schema:
+            type: string
+          required: true
+          description: Markets to fetch depth snapshots for
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DepthResponse'
+        '400':
+          description: Invalid request or missing interval
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No results found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 components:
   schemas:
     AlertPayload:
@@ -150,6 +197,8 @@ components:
               type: integer
             lsell:
               type: integer
+            oi:
+              type: number
             market:
               type: string
             open:
@@ -169,4 +218,32 @@ components:
                 - type: number
                 - type: string
             nullable: true
+    DepthResponse:
+      type: object
+      properties:
+        format:
+          type: string
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              time:
+                type: integer
+              market:
+                type: string
+              mid:
+                type: number
+              priceStep:
+                type: number
+              bids:
+                type: object
+                additionalProperties:
+                  type: number
+              asks:
+                type: object
+                additionalProperties:
+                  type: number
+              rangePercent:
+                type: number
               

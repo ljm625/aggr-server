@@ -39,10 +39,22 @@
     "BINANCE_FUTURES:ethusd_perp"
   ],
   "backupInterval": 5000,
+  "openInterestInterval": 30000,
+  "depthSnapshotInterval": 60000,
+  "depthRangePercent": 10,
+  "depthBucketPercent": 0.1,
+  "depthPriceSteps": {
+    "BTC": 100,
+    "ETH": 10
+  },
+  "hyperliquidOrderBookServerUrl": null,
+  "hyperliquidOrderBookServerChannel": "l4Book",
+  "hyperliquidOrderBookLevels": 100,
   "collect": true,
   "storage": [
     "files"
   ],
   "origin": ".*",
-  "filesLocation": "./data"
+  "filesLocation": "./data",
+  "depthLocation": "./depth"
 }

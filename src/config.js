@@ -104,6 +104,33 @@ const defaultConfig = {
   // store interval (in ms)
   backupInterval: 10000,
 
+  // delay between open interest refreshes (in ms)
+  openInterestInterval: 30000,
+
+  // delay between depth snapshots (in ms), 0 disables depth collection
+  depthSnapshotInterval: 60000,
+
+  // maximum distance from mid price stored in depth snapshots (in %)
+  depthRangePercent: 10,
+
+  // target bucket width (in % of mid price) used only when auto-selecting an absolute price step
+  depthBucketPercent: 0.1,
+
+  // optional fixed absolute depth step by market or asset symbol, eg { "BTC": 100, "ETH": 10 }
+  depthPriceSteps: {},
+
+  // destination folder for order book depth snapshots
+  depthLocation: './depth',
+
+  // optional local Hyperliquid order book websocket server, eg ws://127.0.0.1:8000/ws
+  hyperliquidOrderBookServerUrl: null,
+
+  // local Hyperliquid order book server channel, either "l4Book" or "l2Book"
+  hyperliquidOrderBookServerChannel: 'l4Book',
+
+  // depth levels requested from the local Hyperliquid order book server (1-100)
+  hyperliquidOrderBookLevels: 100,
+
   // influx db server to use when storage is set to "influx"
   influxHost: 'localhost',
   influxPort: 8086,

@@ -22,6 +22,10 @@ class Binance extends Exchange {
     return data.symbols.map(a => a.symbol.toLowerCase())
   }
 
+  supportsOrderBook() {
+    return true
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -34,7 +38,7 @@ class Binance extends Exchange {
 
     this.subscriptions[pair] = ++this.lastSubscriptionId
 
-    const params = [pair + '@trade']
+    const params = [pair + '@trade', pair + '@depth@100ms']
 
     api.send(
       JSON.stringify({
@@ -43,6 +47,13 @@ class Binance extends Exchange {
         id: this.subscriptions[pair]
       })
     )
+
+    this.initializeOrderBook(api, pair).catch(error => {
+      console.error(
+        `[${this.id}] failed to initialize order book on ${pair}`,
+        error.message
+      )
+    })
 
     // this websocket api have a limit of about 5 messages per second.
     await sleep(250 * this.apis.length)
@@ -58,7 +69,7 @@ class Binance extends Exchange {
       return
     }
 
-    const params = [pair + '@trade']
+    const params = [pair + '@trade', pair + '@depth@100ms']
 
     api.send(
       JSON.stringify({
@@ -69,6 +80,7 @@ class Binance extends Exchange {
     )
 
     delete this.subscriptions[pair]
+    this.invalidateOrderBookInitialization(api, pair)
 
     // this websocket api have a limit of about 5 messages per second.
     await sleep(250 * this.apis.length)
@@ -76,6 +88,10 @@ class Binance extends Exchange {
 
   onMessage(event, api) {
     const json = JSON.parse(event.data)
+
+    if (json.e === 'depthUpdate') {
+      return this.handleOrderBookUpdate(api, json)
+    }
 
     if (json.E) {
       return this.emitTrades(api.id, [
@@ -93,6 +109,135 @@ class Binance extends Exchange {
       size: +trade.q,
       side: trade.m ? 'sell' : 'buy'
     }
+  }
+
+  invalidateOrderBookInitialization(api, pair) {
+    api._orderBookInitTokens[pair] = (api._orderBookInitTokens[pair] || 0) + 1
+    delete api._orderBookBuffers[pair]
+  }
+
+  rebuildOrderBook(api, pair, reason) {
+    const orderBook = this.getOrderBook(pair)
+
+    if (orderBook.initializing) {
+      return true
+    }
+
+    console.warn(
+      `[${this.id}] depth sequence broke on ${pair}${
+        reason ? ` (${reason})` : ''
+      }, rebuilding local book`
+    )
+
+    this.initializeOrderBook(api, pair, { resetBuffer: true }).catch(error => {
+      console.error(
+        `[${this.id}] failed to rebuild order book on ${pair}`,
+        error.message
+      )
+    })
+
+    return true
+  }
+
+  async initializeOrderBook(api, pair, options = {}) {
+    if (!this.supportsOrderBook(pair)) {
+      return
+    }
+
+    const { resetBuffer = false } = options
+    const orderBook = this.getOrderBook(pair)
+
+    if (orderBook.initializing) {
+      return
+    }
+
+    const initToken = (api._orderBookInitTokens[pair] || 0) + 1
+
+    api._orderBookInitTokens[pair] = initToken
+    orderBook.initializing = true
+    orderBook.synced = false
+    orderBook.ready = false
+
+    if (resetBuffer || !Array.isArray(api._orderBookBuffers[pair])) {
+      api._orderBookBuffers[pair] = []
+    }
+
+    try {
+      const response = await this.fetchJson(
+        `https://data-api.binance.vision/api/v3/depth?symbol=${pair.toUpperCase()}&limit=5000`
+      )
+
+      if (api._orderBookInitTokens[pair] !== initToken) {
+        return
+      }
+
+      this.resetOrderBook(pair, response.bids, response.asks, Date.now(), {
+        lastUpdateId: +response.lastUpdateId,
+        synced: false
+      })
+
+      this.getOrderBook(pair).initializing = false
+
+      const bufferedUpdates = (api._orderBookBuffers[pair] || []).sort(
+        (a, b) => a.U - b.U
+      )
+
+      api._orderBookBuffers[pair] = []
+
+      for (const update of bufferedUpdates) {
+        this.handleOrderBookUpdate(api, update)
+      }
+    } finally {
+      if (api._orderBookInitTokens[pair] === initToken && this.orderBooks[pair]) {
+        this.orderBooks[pair].initializing = false
+      }
+    }
+  }
+
+  handleOrderBookUpdate(api, update) {
+    const pair = update.s.toLowerCase()
+    const orderBook = this.getOrderBook(pair)
+    const firstUpdateId = +update.U
+    const lastUpdateId = +update.u
+
+    if (orderBook.initializing || typeof orderBook.lastUpdateId !== 'number') {
+      api._orderBookBuffers[pair] = api._orderBookBuffers[pair] || []
+      api._orderBookBuffers[pair].push(update)
+      return true
+    }
+
+    if (!isFinite(firstUpdateId) || !isFinite(lastUpdateId)) {
+      return true
+    }
+
+    if (lastUpdateId <= orderBook.lastUpdateId) {
+      return true
+    }
+
+    const expectedNextUpdateId = orderBook.lastUpdateId + 1
+
+    if (!orderBook.synced) {
+      if (
+        firstUpdateId > expectedNextUpdateId ||
+        lastUpdateId < expectedNextUpdateId
+      ) {
+        return this.rebuildOrderBook(api, pair, 'snapshot bridge missing')
+      }
+    } else if (firstUpdateId > expectedNextUpdateId) {
+      return this.rebuildOrderBook(api, pair, 'gap detected')
+    }
+
+    this.applyOrderBookDelta(pair, update.b, update.a, update.E, {
+      lastUpdateId,
+      synced: true
+    })
+
+    return true
+  }
+
+  onApiCreated(api) {
+    api._orderBookBuffers = {}
+    api._orderBookInitTokens = {}
   }
 
   getMissingTrades(range, totalRecovered = 0) {

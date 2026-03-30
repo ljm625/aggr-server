@@ -34,6 +34,10 @@ class Server extends EventEmitter {
       sum: 0,
       points: []
     }
+    this.latestOpenInterests = {}
+    this.isFetchingOpenInterest = false
+    this.depthStorage = null
+    this.isCapturingDepthSnapshots = false
 
     /**
      * raw trades ready to be persisted into storage next save
@@ -60,7 +64,7 @@ class Server extends EventEmitter {
       )
     }
 
-    this.initStorages().then(() => {
+    Promise.all([this.initStorages(), this.initDepthStorage()]).then(() => {
       if (config.collect) {
         if (this.storages) {
           const delay = this.scheduleNextBackup()
@@ -69,6 +73,18 @@ class Server extends EventEmitter {
             `[server] scheduling first save to ${this.storages.map(
               storage => storage.constructor.name
             )} in ${getHms(delay)}...`
+          )
+        }
+
+        if (config.openInterestInterval > 0) {
+          this.scheduleOpenInterestRefresh(
+            Math.min(config.openInterestInterval, 5000)
+          )
+        }
+
+        if (config.depthSnapshotInterval > 0 && this.depthStorage) {
+          this.scheduleDepthSnapshotCapture(
+            Math.min(config.depthSnapshotInterval, 5000)
           )
         }
       }
@@ -129,6 +145,19 @@ class Server extends EventEmitter {
     console.log('[storage] all storage ready')
 
     return Promise.all(promises)
+  }
+
+  initDepthStorage() {
+    if (
+      (!config.collect || config.depthSnapshotInterval <= 0) &&
+      !config.api
+    ) {
+      return Promise.resolve()
+    }
+
+    this.depthStorage = new (require('./storage/depth'))()
+
+    return Promise.resolve()
   }
 
   backupTrades(exitBackup) {
@@ -194,6 +223,164 @@ class Server extends EventEmitter {
     this.backupTimeout = setTimeout(this.backupTrades.bind(this), delay)
 
     return delay
+  }
+
+  scheduleOpenInterestRefresh(delay = config.openInterestInterval) {
+    if (!config.collect || config.openInterestInterval <= 0) {
+      return
+    }
+
+    clearTimeout(this._openInterestTimeout)
+    this._openInterestTimeout = setTimeout(
+      this.refreshOpenInterests.bind(this),
+      Math.max(1000, delay)
+    )
+  }
+
+  scheduleDepthSnapshotCapture(delay = config.depthSnapshotInterval) {
+    if (
+      !config.collect ||
+      config.depthSnapshotInterval <= 0 ||
+      !this.depthStorage
+    ) {
+      return
+    }
+
+    clearTimeout(this._depthSnapshotTimeout)
+    this._depthSnapshotTimeout = setTimeout(
+      this.captureDepthSnapshots.bind(this),
+      Math.max(1000, delay)
+    )
+  }
+
+  async refreshOpenInterests() {
+    if (
+      !config.collect ||
+      config.openInterestInterval <= 0 ||
+      this.isFetchingOpenInterest
+    ) {
+      this.scheduleOpenInterestRefresh()
+      return
+    }
+
+    this.isFetchingOpenInterest = true
+
+    try {
+      await Promise.all(
+        this.exchanges.map(async exchange => {
+          const pairs = config.pairs
+            .filter(market => new RegExp('^' + exchange.id + ':').test(market))
+            .map(market => market.replace(/[^:]*:/, ''))
+            .filter(pair => exchange.supportsOpenInterest(pair))
+
+          if (!pairs.length) {
+            return
+          }
+
+          let openInterests = {}
+
+          try {
+            openInterests = await exchange.fetchOpenInterests(pairs)
+          } catch (error) {
+            console.error(
+              `[${exchange.id}] failed to refresh open interests`,
+              error.message
+            )
+            return
+          }
+
+          const timestamp = Date.now()
+
+          for (const pair in openInterests) {
+            const market = exchange.id + ':' + pair
+            const value = +openInterests[pair]
+
+            if (!isFinite(value)) {
+              continue
+            }
+
+            if (this.latestOpenInterests[market] === value) {
+              continue
+            }
+
+            this.latestOpenInterests[market] = value
+
+            if (this.storages) {
+              this.chunk.push({
+                exchange: exchange.id,
+                pair,
+                timestamp,
+                openInterest: value
+              })
+            }
+          }
+        })
+      )
+    } finally {
+      this.isFetchingOpenInterest = false
+      this.scheduleOpenInterestRefresh()
+    }
+  }
+
+  async captureDepthSnapshots() {
+    if (
+      !config.collect ||
+      config.depthSnapshotInterval <= 0 ||
+      !this.depthStorage ||
+      this.isCapturingDepthSnapshots
+    ) {
+      this.scheduleDepthSnapshotCapture()
+      return
+    }
+
+    this.isCapturingDepthSnapshots = true
+
+    try {
+      const timestamp = Date.now()
+      const snapshots = []
+
+      for (const exchange of this.exchanges) {
+        const pairs = config.pairs
+          .filter(market => new RegExp('^' + exchange.id + ':').test(market))
+          .map(market => market.replace(/[^:]*:/, ''))
+          .filter(pair => exchange.supportsOrderBook(pair))
+
+        for (const pair of pairs) {
+          const snapshot = exchange.getOrderBookSnapshot(pair)
+
+          if (!snapshot) {
+            continue
+          }
+
+          const hasDepth =
+            Object.keys(snapshot.bids).length > 0 ||
+            Object.keys(snapshot.asks).length > 0
+
+          if (!hasDepth) {
+            continue
+          }
+
+          snapshots.push({
+            time: timestamp,
+            market: `${exchange.id}:${pair}`,
+            mid: snapshot.mid,
+            priceStep: snapshot.priceStep,
+            bids: snapshot.bids,
+            asks: snapshot.asks,
+            rangePercent: snapshot.rangePercent
+          })
+        }
+      }
+
+      if (snapshots.length) {
+        await this.depthStorage.save(snapshots)
+      }
+    } catch (error) {
+      console.error('[server] failed to capture depth snapshots', error.message)
+    } finally {
+      this.isCapturingDepthSnapshots = false
+      this.scheduleDepthSnapshotCapture()
+    }
   }
 
   handleExchangesEvents() {
@@ -468,6 +655,58 @@ class Server extends EventEmitter {
       }
     )
 
+    app.get('/depth/:from/:to/:markets([^/]*)?', (req, res) => {
+      let from = parseInt(req.params.from)
+      let to = parseInt(req.params.to)
+      let markets = req.params.markets || []
+
+      if (typeof markets === 'string') {
+        markets = markets
+          .split('+')
+          .map(a => a.trim())
+          .filter(a => a.length)
+      }
+
+      if (!config.api || !this.depthStorage) {
+        return res.status(501).json({
+          error: 'no depth storage'
+        })
+      }
+
+      if (isNaN(from) || isNaN(to)) {
+        return res.status(400).json({
+          error: 'missing interval'
+        })
+      }
+
+      if (from > to) {
+        return res.status(400).json({
+          error: 'from > to'
+        })
+      }
+
+      return this.depthStorage
+        .fetch({
+          from,
+          to,
+          markets
+        })
+        .then(output => {
+          if (!output || !output.results.length) {
+            return res.status(404).json({
+              error: 'no results'
+            })
+          }
+
+          return res.status(200).json(output)
+        })
+        .catch(error => {
+          return res.status(500).json({
+            error: error.message
+          })
+        })
+    })
+
     app.use(function (err, req, res, _next) {
       if (err) {
         console.error(err)
@@ -580,6 +819,7 @@ class Server extends EventEmitter {
     } else {
       registerIndexes()
       socketService.syncMarkets()
+      this.scheduleOpenInterestRefresh(1000)
 
       this.savePairs()
     }
@@ -613,6 +853,7 @@ class Server extends EventEmitter {
           try {
             await exchange.unlink(market)
             config.pairs.splice(marketIndex, 1)
+            delete this.latestOpenInterests[market]
             results.push(`${market} ✅`)
           } catch (error) {
             console.error(error.message)

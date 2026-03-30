@@ -170,7 +170,16 @@ class FilesStorage {
   }
 
   prepareTrades(trades) {
-    const groups = groupTrades(trades, false)
+    const groups = groupTrades(
+      trades.filter(
+        trade =>
+          typeof trade.price === 'number' &&
+          typeof trade.size === 'number' &&
+          isFinite(trade.price) &&
+          isFinite(trade.size)
+      ),
+      false
+    )
 
     const output = Object.keys(groups).reduce((obj, pair) => {
       obj[pair] = {}

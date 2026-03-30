@@ -75,6 +75,10 @@ class Kraken extends Exchange {
     }
   }
 
+  supportsOrderBook(pair) {
+    return typeof this.specs[pair] === 'undefined'
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -93,15 +97,30 @@ class Kraken extends Exchange {
       // futures contract
       event.product_ids = [pair]
       event.feed = 'trade'
+      api.send(JSON.stringify(event))
     } else {
       // spot
-      event.pair = [pair]
-      event.subscription = {
-        name: 'trade'
-      }
+      api.send(
+        JSON.stringify({
+          event: 'subscribe',
+          pair: [pair],
+          subscription: {
+            name: 'trade'
+          }
+        })
+      )
+      api.send(
+        JSON.stringify({
+          event: 'subscribe',
+          pair: [pair],
+          subscription: {
+            name: 'book',
+            depth: 1000
+          }
+        })
+      )
+      return
     }
-
-    api.send(JSON.stringify(event))
   }
 
   /**
@@ -122,15 +141,30 @@ class Kraken extends Exchange {
       // futures contract
       event.product_ids = [pair]
       event.feed = 'trade'
+      api.send(JSON.stringify(event))
     } else {
       // spot
-      event.pair = [pair]
-      event.subscription = {
-        name: 'trade'
-      }
+      api.send(
+        JSON.stringify({
+          event: 'unsubscribe',
+          pair: [pair],
+          subscription: {
+            name: 'trade'
+          }
+        })
+      )
+      api.send(
+        JSON.stringify({
+          event: 'unsubscribe',
+          pair: [pair],
+          subscription: {
+            name: 'book',
+            depth: 1000
+          }
+        })
+      )
+      return
     }
-
-    api.send(JSON.stringify(event))
   }
 
   formatTrade(trade, pair, isFutures) {
@@ -163,11 +197,111 @@ class Kraken extends Exchange {
     }
   }
 
+  getSpotOrderBookTimestamp(levels) {
+    let latestTimestamp = 0
+
+    for (const level of levels || []) {
+      const timestamp = +level[2]
+
+      if (isFinite(timestamp) && timestamp > latestTimestamp) {
+        latestTimestamp = timestamp
+      }
+    }
+
+    return latestTimestamp ? latestTimestamp * 1000 : Date.now()
+  }
+
+  handleSpotOrderBookMessage(message) {
+    const pair = message[message.length - 1]
+    const channelName = message[message.length - 2]
+
+    if (!pair || !/^book-/.test(channelName)) {
+      return false
+    }
+
+    const payloads = message.slice(1, -2).filter(
+      payload => payload && typeof payload === 'object' && !Array.isArray(payload)
+    )
+
+    if (!payloads.length) {
+      return true
+    }
+
+    const snapshotBids = []
+    const snapshotAsks = []
+    const bids = []
+    const asks = []
+    let latestTimestamp = 0
+    let hasSnapshot = false
+
+    for (const payload of payloads) {
+      if (Array.isArray(payload.bs)) {
+        snapshotBids.push(...payload.bs)
+        latestTimestamp = Math.max(
+          latestTimestamp,
+          this.getSpotOrderBookTimestamp(payload.bs)
+        )
+        hasSnapshot = true
+      }
+
+      if (Array.isArray(payload.as)) {
+        snapshotAsks.push(...payload.as)
+        latestTimestamp = Math.max(
+          latestTimestamp,
+          this.getSpotOrderBookTimestamp(payload.as)
+        )
+        hasSnapshot = true
+      }
+
+      if (Array.isArray(payload.b)) {
+        bids.push(...payload.b)
+        latestTimestamp = Math.max(
+          latestTimestamp,
+          this.getSpotOrderBookTimestamp(payload.b)
+        )
+      }
+
+      if (Array.isArray(payload.a)) {
+        asks.push(...payload.a)
+        latestTimestamp = Math.max(
+          latestTimestamp,
+          this.getSpotOrderBookTimestamp(payload.a)
+        )
+      }
+    }
+
+    if (hasSnapshot) {
+      this.resetOrderBook(
+        pair,
+        snapshotBids,
+        snapshotAsks,
+        latestTimestamp || Date.now()
+      )
+
+      if (bids.length || asks.length) {
+        this.applyOrderBookDelta(pair, bids, asks, latestTimestamp || Date.now())
+      }
+
+      return true
+    }
+
+    if (bids.length || asks.length) {
+      this.applyOrderBookDelta(pair, bids, asks, latestTimestamp || Date.now())
+      return true
+    }
+
+    return false
+  }
+
   onMessage(event, api) {
     const json = JSON.parse(event.data)
 
     if (!json || json.event === 'heartbeat') {
       return
+    }
+
+    if (Array.isArray(json) && this.handleSpotOrderBookMessage(json)) {
+      return true
     }
 
     if (json.feed === 'trade' && json.qty) {

@@ -42,6 +42,23 @@ All settings are optional and can be customized in the [server configuration fil
 
 See [server configuration file](src/config.js) for all server options available.
 
+### Hyperliquid local order book server
+
+If you run a local instance of `hyperliquid-dex/order_book_server`, you can point `aggr-server` to it for deeper Hyperliquid books:
+
+```json
+{
+  "hyperliquidOrderBookServerUrl": "ws://127.0.0.1:8000/ws",
+  "hyperliquidOrderBookServerChannel": "l4Book",
+  "hyperliquidOrderBookLevels": 100
+}
+```
+
+When `hyperliquidOrderBookServerUrl` is set, `aggr-server` will subscribe to that websocket.
+Set `hyperliquidOrderBookServerChannel` to `l4Book` to consume the full local order book diff stream, or `l2Book` to request a truncated `l2Book` feed with up to `hyperliquidOrderBookLevels` levels.
+When it is not set, `aggr-server` falls back to Hyperliquid's official websocket API.
+Note that Hyperliquid's official public `l2Book` is limited to at most 20 levels per side, so the 100-level setting only applies to the local server.
+
 Users can set configuration options using the CLI. Examples of the command-line arguments are:
 
 - Setting port:

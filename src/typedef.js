@@ -8,6 +8,7 @@
  * @property {number} size           - The size or quantity of the trade.
  * @property {number} side           - The side of the trade (1 for buy, 2 for sell, for example).
  * @property {boolean} [liquidation] - Optional. Indicates whether the trade was a liquidation.
+ * @property {number} [openInterest] - Optional. Open interest snapshot in USD notional.
  */
 
 /**
@@ -23,6 +24,7 @@
   vsell: number,
   lbuy: number,
   lsell: number,
+  oi: number,
   open: number,
   high: number,
   low: number,

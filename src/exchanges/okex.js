@@ -1,6 +1,6 @@
 const Exchange = require('../exchange')
 const axios = require('axios')
-const { getHms } = require('../helper')
+const { getHms, sleep } = require('../helper')
 
 class Okex extends Exchange {
   constructor() {
@@ -68,6 +68,77 @@ class Okex extends Exchange {
     }
   }
 
+  supportsOpenInterest(pair) {
+    return !!this.types[pair] && this.types[pair] !== 'SPOT'
+  }
+
+  supportsOrderBook(pair) {
+    return !!this.types[pair]
+  }
+
+  getOrderBookArgs(pair) {
+    return {
+      channel: 'books',
+      instId: pair
+    }
+  }
+
+  isPairTrackedByApi(api, pair) {
+    return api._connected.indexOf(pair) !== -1 || api._pending.indexOf(pair) !== -1
+  }
+
+  async fetchOpenInterests(pairs) {
+    const openInterests = {}
+    const pairsByType = pairs.reduce((output, pair) => {
+      const type = this.types[pair]
+
+      if (!type || type === 'SPOT') {
+        return output
+      }
+
+      if (!output[type]) {
+        output[type] = []
+      }
+
+      output[type].push(pair)
+
+      return output
+    }, {})
+
+    await Promise.all(
+      Object.keys(pairsByType).map(async type => {
+        const response = await this.fetchJson(
+          `https://www.okx.com/api/v5/public/open-interest?instType=${type}`
+        )
+        const byPair = ((response && response.data) || []).reduce(
+          (output, ticker) => {
+            output[ticker.instId] = ticker
+            return output
+          },
+          {}
+        )
+
+        for (const pair of pairsByType[type]) {
+          const ticker = byPair[pair]
+
+          if (!ticker || !ticker.oiUsd) {
+            continue
+          }
+
+          const value = +ticker.oiUsd
+
+          if (!isFinite(value)) {
+            continue
+          }
+
+          openInterests[pair] = value
+        }
+      })
+    )
+
+    return openInterests
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -84,6 +155,10 @@ class Okex extends Exchange {
         args: [
           {
             channel: 'trades',
+            instId: pair
+          },
+          {
+            channel: 'books',
             instId: pair
           }
         ]
@@ -103,6 +178,11 @@ class Okex extends Exchange {
         })
       )
     }
+
+    this.initializeOrderBook(api, pair, {
+      resetBuffer: true,
+      clearBook: true
+    })
   }
 
   /**
@@ -122,6 +202,10 @@ class Okex extends Exchange {
           {
             channel: 'trades',
             instId: pair
+          },
+          {
+            channel: 'books',
+            instId: pair
           }
         ]
       })
@@ -130,7 +214,7 @@ class Okex extends Exchange {
     if (this.types[pair] !== 'SPOT') {
       api.send(
         JSON.stringify({
-          op: 'subscribe',
+          op: 'unsubscribe',
           args: [
             {
               channel: 'liquidation-orders',
@@ -140,12 +224,32 @@ class Okex extends Exchange {
         })
       )
     }
+
+    this.invalidateOrderBookInitialization(api, pair)
+    this.clearOrderBook(pair)
   }
 
   onMessage(event, api) {
+    if (event.data === 'pong') {
+      return
+    }
+
     const json = JSON.parse(event.data)
 
-    if (!json || !json.data) {
+    if (!json) {
+      return
+    }
+
+    if (json.event === 'error') {
+      console.warn(
+        `[${this.id}] websocket error${
+          json.arg && json.arg.channel ? ` on ${json.arg.channel}` : ''
+        }: ${json.msg || json.code || 'unknown error'}`
+      )
+      return true
+    }
+
+    if (!json.data) {
       return
     }
 
@@ -165,10 +269,229 @@ class Okex extends Exchange {
       return this.emitLiquidations(api.id, liqs)
     }
 
+    if (json.arg.channel === 'books') {
+      return this.handleOrderBookMessage(json, api)
+    }
+
     return this.emitTrades(
       api.id,
       json.data.map(trade => this.formatTrade(trade))
     )
+  }
+
+  invalidateOrderBookInitialization(api, pair) {
+    api._orderBookInitTokens[pair] = (api._orderBookInitTokens[pair] || 0) + 1
+    delete api._orderBookBuffers[pair]
+
+    if (api._orderBookSnapshotTimeouts[pair]) {
+      clearTimeout(api._orderBookSnapshotTimeouts[pair])
+      delete api._orderBookSnapshotTimeouts[pair]
+    }
+  }
+
+  rebuildOrderBook(api, pair, reason) {
+    if (!api || !this.isPairTrackedByApi(api, pair)) {
+      return true
+    }
+
+    if (api._orderBookRebuilds[pair]) {
+      return true
+    }
+
+    api._orderBookRebuilds[pair] = true
+
+    console.warn(
+      `[${this.id}] depth sequence broke on ${pair}${
+        reason ? ` (${reason})` : ''
+      }, rebuilding local book`
+    )
+
+    this.initializeOrderBook(api, pair, {
+      resetBuffer: true,
+      clearBook: true
+    })
+
+    const args = [this.getOrderBookArgs(pair)]
+
+    ;(async () => {
+      try {
+        if (api.readyState === 1) {
+          api.send(
+            JSON.stringify({
+              op: 'unsubscribe',
+              args
+            })
+          )
+        }
+
+        await sleep(150)
+
+        if (api.readyState === 1 && this.isPairTrackedByApi(api, pair)) {
+          api.send(
+            JSON.stringify({
+              op: 'subscribe',
+              args
+            })
+          )
+        }
+      } catch (error) {
+        console.error(
+          `[${this.id}] failed to rebuild order book on ${pair}`,
+          error.message
+        )
+      } finally {
+        delete api._orderBookRebuilds[pair]
+      }
+    })()
+
+    return true
+  }
+
+  initializeOrderBook(api, pair, options = {}) {
+    if (!this.supportsOrderBook(pair)) {
+      return false
+    }
+
+    const { resetBuffer = false, clearBook = false } = options
+
+    if (clearBook) {
+      this.clearOrderBook(pair)
+    }
+
+    const orderBook = this.getOrderBook(pair)
+    const initToken = (api._orderBookInitTokens[pair] || 0) + 1
+
+    api._orderBookInitTokens[pair] = initToken
+    orderBook.initializing = true
+    orderBook.ready = false
+    delete orderBook.seqId
+    delete orderBook.prevSeqId
+
+    if (resetBuffer || !Array.isArray(api._orderBookBuffers[pair])) {
+      api._orderBookBuffers[pair] = []
+    }
+
+    if (api._orderBookSnapshotTimeouts[pair]) {
+      clearTimeout(api._orderBookSnapshotTimeouts[pair])
+    }
+
+    api._orderBookSnapshotTimeouts[pair] = setTimeout(() => {
+      if (api._orderBookInitTokens[pair] !== initToken) {
+        return
+      }
+
+      const latestBook = this.orderBooks[pair]
+
+      if (latestBook && latestBook.initializing) {
+        this.rebuildOrderBook(api, pair, 'snapshot timeout')
+      }
+    }, 5000)
+
+    return true
+  }
+
+  handleOrderBookMessage(message, api) {
+    const book = message.data && message.data[0]
+    const pair = (message.arg && message.arg.instId) || (book && book.instId)
+
+    if (!book || !pair) {
+      return
+    }
+
+    const orderBook = this.getOrderBook(pair)
+    const seqId = +book.seqId
+    const prevSeqId = +book.prevSeqId
+    const timestamp = +book.ts || Date.now()
+
+    if (message.action === 'snapshot') {
+      if (api && api._orderBookSnapshotTimeouts[pair]) {
+        clearTimeout(api._orderBookSnapshotTimeouts[pair])
+        delete api._orderBookSnapshotTimeouts[pair]
+      }
+
+      this.resetOrderBook(pair, book.bids, book.asks, timestamp, {
+        seqId,
+        prevSeqId
+      })
+
+      const latestOrderBook = this.getOrderBook(pair)
+      latestOrderBook.initializing = false
+
+      const bufferedUpdates = api
+        ? (api._orderBookBuffers[pair] || [])
+          .filter(update => {
+            const updateBook = update.data && update.data[0]
+            return updateBook && +updateBook.seqId > seqId
+          })
+          .sort((a, b) => {
+            const aBook = a.data && a.data[0]
+            const bBook = b.data && b.data[0]
+
+            return (
+              (+aBook?.seqId || +aBook?.ts || 0) - (+bBook?.seqId || +bBook?.ts || 0)
+            )
+          })
+        : []
+
+      if (api) {
+        api._orderBookBuffers[pair] = []
+      }
+
+      for (const update of bufferedUpdates) {
+        this.handleOrderBookMessage(update, api)
+      }
+
+      return true
+    }
+
+    if (api && (orderBook.initializing || !isFinite(orderBook.seqId))) {
+      api._orderBookBuffers[pair] = api._orderBookBuffers[pair] || []
+      api._orderBookBuffers[pair].push(message)
+      return true
+    }
+
+    if (
+      (!Array.isArray(book.bids) || !book.bids.length) &&
+      (!Array.isArray(book.asks) || !book.asks.length) &&
+      isFinite(prevSeqId) &&
+      isFinite(seqId) &&
+      prevSeqId === seqId &&
+      seqId === orderBook.seqId
+    ) {
+      orderBook.timestamp = timestamp
+      return true
+    }
+
+    if (!isFinite(seqId) || !isFinite(prevSeqId)) {
+      if (api) {
+        return this.rebuildOrderBook(api, pair, 'missing sequence metadata')
+      }
+
+      return true
+    }
+
+    if (seqId < prevSeqId) {
+      if (api) {
+        return this.rebuildOrderBook(api, pair, 'sequence reset')
+      }
+
+      return true
+    }
+
+    if (isFinite(orderBook.seqId) && prevSeqId !== orderBook.seqId) {
+      if (api) {
+        return this.rebuildOrderBook(api, pair, 'prevSeqId mismatch')
+      }
+
+      return true
+    }
+
+    this.applyOrderBookDelta(pair, book.bids, book.asks, timestamp, {
+      seqId,
+      prevSeqId
+    })
+
+    return true
   }
 
   formatTrade(trade) {
@@ -208,6 +531,32 @@ class Okex extends Exchange {
     }
   }
 
+  getOrderBookLevelNotional(pair, price, size) {
+    if (typeof this.specs[pair] !== 'number') {
+      return price * size
+    }
+
+    return this.inversed[pair]
+      ? size * this.specs[pair]
+      : size * this.specs[pair] * price
+  }
+
+  onApiCreated(api) {
+    api._orderBookBuffers = {}
+    api._orderBookInitTokens = {}
+    api._orderBookRebuilds = {}
+    api._orderBookSnapshotTimeouts = {}
+    this.startKeepAlive(api, 'ping', 25000)
+  }
+
+  onApiRemoved(api) {
+    Object.keys(api._orderBookSnapshotTimeouts).forEach(pair => {
+      clearTimeout(api._orderBookSnapshotTimeouts[pair])
+    })
+
+    this.stopKeepAlive(api)
+  }
+
   getLiquidationsUrl(range) {
     // after query param = before
     // (get the 100 trades preceding endTimestamp)
@@ -237,12 +586,14 @@ class Okex extends Exchange {
 
   async fetchAllLiquidationOrders(range) {
     const allLiquidations = []
+    let hasMore = true
 
-    while (true) {
+    while (hasMore) {
       const liquidations = await this.fetchLiquidationOrders(range)
 
       if (!liquidations || liquidations.length === 0) {
-        return allLiquidations
+        hasMore = false
+        continue
       }
 
       for (const liquidation of liquidations) {
@@ -255,6 +606,8 @@ class Okex extends Exchange {
 
       range.to = +liquidations[liquidations.length - 1].ts
     }
+
+    return allLiquidations
   }
 
   async getMissingTrades(range, totalRecovered = 0, first = true) {

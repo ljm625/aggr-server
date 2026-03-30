@@ -56,6 +56,21 @@ class Coinbase extends Exchange {
     }
   }
 
+  getWsClientConfig(url) {
+    if (url === 'wss://ws-feed.exchange.coinbase.com') {
+      return {
+        maxReceivedFrameSize: 4 * 1024 * 1024,
+        maxReceivedMessageSize: 16 * 1024 * 1024
+      }
+    }
+
+    return null
+  }
+
+  supportsOrderBook(pair) {
+    return !INTX_PAIR_REGEX.test(pair)
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -77,7 +92,10 @@ class Coinbase extends Exchange {
             product_ids: [pair]
           }
           : {
-            channels: [{ name: 'matches', product_ids: [pair] }]
+            channels: [
+              { name: 'matches', product_ids: [pair] },
+              { name: 'level2_batch', product_ids: [pair] }
+            ]
           })
       })
     )
@@ -109,7 +127,10 @@ class Coinbase extends Exchange {
             product_ids: [pair]
           }
           : {
-            channels: [{ name: 'matches', product_ids: [pair] }]
+            channels: [
+              { name: 'matches', product_ids: [pair] },
+              { name: 'level2_batch', product_ids: [pair] }
+            ]
           })
       })
     )
@@ -124,7 +145,43 @@ class Coinbase extends Exchange {
     const json = JSON.parse(event.data)
 
     if (json) {
-      if (json.type === 'match') {
+      if (json.type === 'snapshot' && this.supportsOrderBook(json.product_id)) {
+        this.resetOrderBook(
+          json.product_id,
+          json.bids || [],
+          json.asks || [],
+          Date.now()
+        )
+
+        return true
+      } else if (
+        json.type === 'l2update' &&
+        this.supportsOrderBook(json.product_id)
+      ) {
+        const bids = []
+        const asks = []
+
+        for (const change of json.changes || []) {
+          if (!Array.isArray(change) || change.length < 3) {
+            continue
+          }
+
+          if (change[0] === 'buy') {
+            bids.push([change[1], change[2]])
+          } else if (change[0] === 'sell') {
+            asks.push([change[1], change[2]])
+          }
+        }
+
+        this.applyOrderBookDelta(
+          json.product_id,
+          bids,
+          asks,
+          json.time ? +new Date(json.time) : Date.now()
+        )
+
+        return true
+      } else if (json.type === 'match') {
         return this.emitTrades(api.id, [
           this.formatTrade(json, json.product_id)
         ])

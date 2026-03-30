@@ -56,6 +56,75 @@ class Bybit extends Exchange {
       types
     }
   }
+
+  supportsOpenInterest(pair) {
+    return !!this.types[pair] && this.types[pair] !== 'spot'
+  }
+
+  supportsOrderBook(pair) {
+    return this.supportsOpenInterest(pair)
+  }
+
+  async fetchOpenInterests(pairs) {
+    const openInterests = {}
+    const pairsByType = pairs.reduce((output, pair) => {
+      const type = this.types[pair]
+
+      if (!type || type === 'spot') {
+        return output
+      }
+
+      if (!output[type]) {
+        output[type] = []
+      }
+
+      output[type].push(pair)
+
+      return output
+    }, {})
+
+    await Promise.all(
+      Object.keys(pairsByType).map(async type => {
+        const response = await this.fetchJson(
+          `https://api.bybit.com/v5/market/tickers?category=${type}`
+        )
+        const tickers = (response.result && response.result.list) || []
+        const byPair = tickers.reduce((output, ticker) => {
+          output[ticker.symbol] = ticker
+          return output
+        }, {})
+
+        for (const pair of pairsByType[type]) {
+          const ticker = byPair[pair]
+
+          if (!ticker) {
+            continue
+          }
+
+          const value = +ticker.openInterest
+
+          if (!isFinite(value)) {
+            continue
+          }
+
+          if (type === 'inverse') {
+            openInterests[pair] = value
+            continue
+          }
+
+          const markPrice = +ticker.markPrice || +ticker.lastPrice
+
+          if (!markPrice) {
+            continue
+          }
+
+          openInterests[pair] = value * markPrice
+        }
+      })
+    )
+
+    return openInterests
+  }
   /**
    * Sub
    * @param {WebSocket} api
@@ -70,6 +139,7 @@ class Bybit extends Exchange {
     const realPair = isSpot ? pair.replace(SPOT_PAIR_REGEX, '') : pair
     const topics = [
       `publicTrade.${realPair}`,
+      `orderbook.1000.${realPair}`
     ]
 
     if (!isSpot) {
@@ -98,6 +168,7 @@ class Bybit extends Exchange {
     const realPair = isSpot ? pair.replace(SPOT_PAIR_REGEX, '') : pair
     const topics = [
       `publicTrade.${realPair}`,
+      `orderbook.1000.${realPair}`
     ]
 
     if (!isSpot) {
@@ -157,6 +228,10 @@ class Bybit extends Exchange {
       return
     }
 
+    if (/^orderbook\./.test(json.topic)) {
+      return this.handleOrderBookMessage(json)
+    }
+
     if (TRADE_TOPIC_REGEX.test(json.topic)) {
       const isSpot = api.url === SPOT_WS
 
@@ -170,6 +245,28 @@ class Bybit extends Exchange {
         json.data.map(liquidation => this.formatLiquidation(liquidation))
       )
     }
+  }
+
+  handleOrderBookMessage(message) {
+    const pair = this.types[message.data.s] === 'spot'
+      ? `${message.data.s}-SPOT`
+      : message.data.s
+
+    if (message.type === 'snapshot') {
+      this.resetOrderBook(pair, message.data.b, message.data.a, message.ts)
+    } else {
+      this.applyOrderBookDelta(pair, message.data.b, message.data.a, message.ts)
+    }
+
+    return true
+  }
+
+  getOrderBookLevelNotional(pair, price, size) {
+    if (this.types[pair] === 'inverse') {
+      return size
+    }
+
+    return price * size
   }
 
   async getMissingTrades(range, totalRecovered = 0) {
