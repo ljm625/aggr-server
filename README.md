@@ -61,6 +61,12 @@ Note that Hyperliquid's official public `l2Book` is limited to at most 20 levels
 
 Users can set configuration options using the CLI. Examples of the command-line arguments are:
 
+- Setting host and port:
+  
+  ```bash
+    node index host=127.0.0.1 port=3001
+  ```
+
 - Setting port:
   
   ```bash

@@ -717,9 +717,9 @@ class Server extends EventEmitter {
       }
     })
 
-    this.server = app.listen(config.port, () => {
+    this.server = app.listen(config.port, config.host, () => {
       console.log(
-        `[server] http server listening at localhost:${config.port}`,
+        `[server] http server listening at ${config.host}:${config.port}`,
         !config.api ? '(historical api is disabled)' : ''
       )
     })

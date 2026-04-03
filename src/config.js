@@ -60,6 +60,9 @@ const defaultConfig = {
   // default server port
   port: 3000,
 
+  // default server host
+  host: '0.0.0.0',
+
   // restrict origin (now using regex)
   origin: '.*',
 
