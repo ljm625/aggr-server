@@ -1,4 +1,5 @@
 const fs = require('fs')
+const path = require('path')
 const zlib = require('zlib')
 const {
   groupTrades,
@@ -65,36 +66,45 @@ class FilesStorage {
     return file.replace(/\s+/g, '')
   }
 
-  async addWritableStream(identifier, ts) {
+  getOpenInterestBackupFilename(identifier, date) {
+    const tradePath = this.getBackupFilename(identifier, date)
+
+    return path.join(
+      path.dirname(tradePath),
+      'oi',
+      `${path.basename(tradePath)}.jsonl`
+    )
+  }
+
+  async addWritableStream(streamId, filePath, ts) {
     const date = new Date(+ts)
-    const path = this.getBackupFilename(identifier, date)
 
     try {
-      await ensureDirectoryExists(path)
+      await ensureDirectoryExists(filePath)
     } catch (error) {
       console.error(
-        `[storage/${this.name}] failed to create target directory ${path}`,
+        `[storage/${this.name}] failed to create target directory ${filePath}`,
         error
       )
     }
 
-    const stream = fs.createWriteStream(path, { flags: 'a' })
+    const stream = fs.createWriteStream(filePath, { flags: 'a' })
 
-    this.writableStreams[identifier + ts] = {
+    this.writableStreams[streamId] = {
       timestamp: +ts,
       stream
     }
 
     stream.on('error', err => {
       console.error(
-        `[storage/${this.name}] ${path} stream encountered an error\n\t${err.message}`
+        `[storage/${this.name}] ${filePath} stream encountered an error\n\t${err.message}`
       )
     })
 
     console.debug(
       `[storage/${
         this.name
-      }] created writable stream ${date.toUTCString()} => ${path}`
+      }] created writable stream ${date.toUTCString()} => ${filePath}`
     )
   }
 
@@ -209,72 +219,129 @@ class FilesStorage {
     return output
   }
 
-  save(trades) {
-    return new Promise(resolve => {
-      const output = this.prepareTrades(trades)
+  prepareOpenInterests(trades) {
+    return trades.reduce((output, trade) => {
+      if (
+        typeof trade.openInterest !== 'number' ||
+        !isFinite(trade.openInterest)
+      ) {
+        return output
+      }
 
-      const promises = []
+      const identifier = trade.exchange + ':' + trade.pair
+      const ts =
+        Math.floor(trade.timestamp / config.filesInterval) * config.filesInterval
 
-      for (let identifier in output) {
-        for (let ts in output[identifier]) {
-          promises.push(
-            new Promise(resolve => {
-              let promiseOfWritableStram = Promise.resolve()
+      if (!output[identifier]) {
+        output[identifier] = {}
+      }
 
-              if (!this.writableStreams[identifier + ts]) {
-                promiseOfWritableStram = this.addWritableStream(identifier, ts)
-              }
-
-              promiseOfWritableStram.then(() => {
-                const stream = this.writableStreams[identifier + ts].stream
-
-                if (!stream) {
-                  console.error(
-                    `[storage/${this.name}] ${identifier}'s stream already closed`
-                  )
-                  return resolve()
-                }
-
-                const waitDrain = !stream.write(
-                  output[identifier][ts].data,
-                  err => {
-                    if (err) {
-                      console.error(
-                        `[storage/${this.name}] stream.write encountered an error\n\t${err}`
-                      )
-                    }
-
-                    if (!waitDrain) {
-                      resolve()
-                    }
-                  }
-                )
-
-                if (waitDrain) {
-                  let drainTimeout = setTimeout(() => {
-                    console.log(
-                      `[storage/${this.name}] ${identifier}'s stream drain timeout fired`
-                    )
-                    drainTimeout = null
-                    resolve()
-                  }, 5000)
-
-                  stream.once('drain', () => {
-                    if (drainTimeout) {
-                      clearTimeout(drainTimeout)
-                      resolve()
-                    } else {
-                      console.log(
-                        `[storage/${this.name}] ${identifier}'s stream drain callback received`
-                      )
-                    }
-                  })
-                }
-              })
-            })
-          )
+      if (!output[identifier][ts]) {
+        output[identifier][ts] = {
+          from: trade.timestamp,
+          to: trade.timestamp,
+          data: ''
         }
       }
+
+      output[identifier][ts].data +=
+        JSON.stringify({
+          timestamp: trade.timestamp,
+          openInterest: trade.openInterest
+        }) + '\n'
+      output[identifier][ts].to = trade.timestamp
+
+      return output
+    }, {})
+  }
+
+  createWritePromises(output, getFilePath) {
+    const promises = []
+
+    for (let identifier in output) {
+      for (let ts in output[identifier]) {
+        promises.push(
+          new Promise(resolve => {
+            const filePath = getFilePath(identifier, +ts)
+            const streamId = filePath
+            let promiseOfWritableStram = Promise.resolve()
+
+            if (!this.writableStreams[streamId]) {
+              promiseOfWritableStram = this.addWritableStream(
+                streamId,
+                filePath,
+                ts
+              )
+            }
+
+            promiseOfWritableStram.then(() => {
+              const stream = this.writableStreams[streamId].stream
+
+              if (!stream) {
+                console.error(
+                  `[storage/${this.name}] ${streamId}'s stream already closed`
+                )
+                return resolve()
+              }
+
+              const waitDrain = !stream.write(
+                output[identifier][ts].data,
+                err => {
+                  if (err) {
+                    console.error(
+                      `[storage/${this.name}] stream.write encountered an error\n\t${err}`
+                    )
+                  }
+
+                  if (!waitDrain) {
+                    resolve()
+                  }
+                }
+              )
+
+              if (waitDrain) {
+                let drainTimeout = setTimeout(() => {
+                  console.log(
+                    `[storage/${this.name}] ${streamId}'s stream drain timeout fired`
+                  )
+                  drainTimeout = null
+                  resolve()
+                }, 5000)
+
+                stream.once('drain', () => {
+                  if (drainTimeout) {
+                    clearTimeout(drainTimeout)
+                    resolve()
+                  } else {
+                    console.log(
+                      `[storage/${this.name}] ${streamId}'s stream drain callback received`
+                    )
+                  }
+                })
+              }
+            })
+          })
+        )
+      }
+    }
+
+    return promises
+  }
+
+  save(trades) {
+    return new Promise(resolve => {
+      const tradeOutput = this.prepareTrades(trades)
+      const openInterestOutput = this.prepareOpenInterests(trades)
+      const promises = this.createWritePromises(
+        tradeOutput,
+        (identifier, ts) => this.getBackupFilename(identifier, new Date(ts))
+      ).concat(
+        this.createWritePromises(
+          openInterestOutput,
+          (identifier, ts) =>
+            this.getOpenInterestBackupFilename(identifier, new Date(ts))
+        )
+      )
 
       Promise.all(promises).then(() => resolve())
     }).then(success => {
